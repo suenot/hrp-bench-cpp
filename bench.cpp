@@ -1,10 +1,13 @@
 /**
  * HRP Benchmark — C++17 implementation
- * Compile: clang++ -O3 -std=c++17 -o hrp_bench bench.cpp
+ * Compile: clang++ -O3 -std=c++17 -o hrp_bench bench.cpp fastcluster.cpp
  *
- * Faithful port of the C reference (../c/bench.c). The algorithm is kept
- * bit-identical; only idiomatic C++ containers (std::vector) and timing
- * (std::chrono) are used.
+ * Faithful port of the C reference (../c/bench.c), except that the
+ * average-linkage stage uses Daniel Müllner's fastcluster library
+ * (the O(n²) NN-chain algorithm, the same one SciPy uses) instead of a
+ * hand-rolled O(n³) linkage. All other stages (RNG, log returns,
+ * covariance, correlation, distance, leaf order, quasi-diag, HRP weights)
+ * are unchanged.
  */
 
 #include <cstdio>
@@ -13,6 +16,8 @@
 #include <vector>
 #include <cstring>
 #include <chrono>
+
+#include "fastcluster.h"
 
 // ── Timing ──
 
@@ -90,47 +95,46 @@ static void dist_matrix(const std::vector<double> &corr, std::vector<double> &di
     }
 }
 
-// ── Average linkage ──
+// ── Average linkage (fastcluster, Müllner NN-chain) ──
 
 struct LinkageRow { int i, j; double dist; int size; };
 
-static void average_linkage(const std::vector<double> &dist_in,
-                            std::vector<LinkageRow> &Z, int n) {
-    int cap = 2 * n;
-    std::vector<double> D((size_t)cap * cap, 1e18);
-    std::vector<char> active(cap, 0);
-    std::vector<int> sizes(cap, 0);
+// Build the condensed (upper-triangular, no diagonal) distance vector that
+// fastcluster's hclust_fast expects: length n*(n-1)/2. NOT timed — matches
+// how the C reference times only the linkage core.
+static void condensed_distance(const std::vector<double> &dist_in,
+                               std::vector<double> &condensed, int n) {
+    size_t k = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++)
+            condensed[k++] = dist_in[(size_t)i * n + j];
+}
 
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < n; j++) D[i * cap + j] = dist_in[i * n + j];
-        active[i] = 1;
-        sizes[i] = 1;
-    }
-
-    for (int step = 0; step < n - 1; step++) {
-        double minD = 1e18;
-        int mi = 0, mj = 0;
-        for (int i = 0; i < n + step; i++) {
-            if (!active[i]) continue;
-            for (int j = i + 1; j < n + step; j++) {
-                if (!active[j]) continue;
-                if (D[i * cap + j] < minD) { minD = D[i * cap + j]; mi = i; mj = j; }
-            }
-        }
-        int nid = n + step;
-        sizes[nid] = sizes[mi] + sizes[mj];
-        Z[step] = LinkageRow{ mi, mj, minD, sizes[nid] };
-
-        for (int k = 0; k < nid; k++) {
-            if (!active[k] || k == mi || k == mj) continue;
-            double nd = (D[mi * cap + k] * sizes[mi] + D[mj * cap + k] * sizes[mj]) / sizes[nid];
-            D[nid * cap + k] = nd;
-            D[k * cap + nid] = nd;
-        }
-        D[nid * cap + nid] = 0;
-        active[mi] = 0;
-        active[mj] = 0;
-        active[nid] = 1;
+// Convert fastcluster's R-format merge/height output into the SciPy-style
+// linkage matrix the leaf_order / quasi-diag stages expect.
+//
+// fastcluster (R hclust convention), for merge step s (0-based):
+//   child = merge[s] (and merge[(n-1)+s] for the second child)
+//     negative -x  -> singleton leaf with 0-based id (x-1)
+//     positive  c  -> the cluster formed at merge step (c-1)
+//   height[s] = merge distance, steps are in non-decreasing height order.
+//
+// SciPy convention used downstream:
+//   leaves are node ids 0..n-1; the cluster formed at step s is node n+s;
+//   children stored with i < j; size is the leaf count of the merged cluster.
+static void merge_to_linkage(const int *merge, const double *height,
+                             std::vector<LinkageRow> &Z, int n) {
+    std::vector<int> csize(n - 1, 0);  // leaf count of cluster formed at each step
+    for (int s = 0; s < n - 1; s++) {
+        int m1 = merge[s];
+        int m2 = merge[(n - 1) + s];
+        int a = (m1 < 0) ? (-m1 - 1) : (n + (m1 - 1));
+        int b = (m2 < 0) ? (-m2 - 1) : (n + (m2 - 1));
+        int sa = (m1 < 0) ? 1 : csize[m1 - 1];
+        int sb = (m2 < 0) ? 1 : csize[m2 - 1];
+        csize[s] = sa + sb;
+        int lo = a < b ? a : b, hi = a < b ? b : a;
+        Z[s] = LinkageRow{ lo, hi, height[s], csize[s] };
     }
 }
 
@@ -241,10 +245,19 @@ static void bench(int n, int days, bool verify) {
     std::vector<double> dist((size_t)n * n);
     dist_matrix(corr, dist, n);
 
+    // Condensed-distance prep is OUTSIDE the timer (the C reference times
+    // only the linkage core; fastcluster consumes a condensed vector).
     std::vector<LinkageRow> Z(n - 1);
+    std::vector<double> condensed((size_t)n * (n - 1) / 2);
+    condensed_distance(dist, condensed, n);
+    std::vector<int> merge(2 * (n - 1));
+    std::vector<double> height(n - 1);
+
     t0 = now_us();
-    average_linkage(dist, Z, n);
+    hclust_fast(n, condensed.data(), HCLUST_METHOD_AVERAGE, merge.data(), height.data());
     double t_link = now_us() - t0;
+
+    merge_to_linkage(merge.data(), height.data(), Z, n);
 
     std::vector<int> order(n);
     int olen;

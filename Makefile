@@ -6,8 +6,8 @@ TARGET    = hrp_bench
 
 build: $(TARGET)
 
-$(TARGET): bench.cpp
-	$(CXX) $(CXXFLAGS) -o $(TARGET) bench.cpp
+$(TARGET): bench.cpp fastcluster.cpp fastcluster.h
+	$(CXX) $(CXXFLAGS) -o $(TARGET) bench.cpp fastcluster.cpp -lm
 
 run: build
 	./$(TARGET)
