@@ -41,6 +41,7 @@ HRP weights and their sum is printed to STDERR for cross-language checking.
 
 ## Complexity note
 
-Average linkage is implemented in **O(n³)** (a full scan for the minimum pair on
-every merge step) and dominates the runtime for large `N`, exactly as in the C
-reference.
+Average linkage uses the **O(n²)** nearest-neighbour-chain algorithm (Müllner
+2011), exactly as in the C reference. Clustering is therefore no longer the
+bottleneck; for large `N` the runtime is dominated by the O(n²·T) covariance
+stage.
